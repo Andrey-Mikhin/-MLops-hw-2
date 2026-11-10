@@ -1,0 +1,89 @@
+name: hw-realtime-inference
+
+services:
+  triton:
+    image: nvcr.nju.edu.cn/nvidia/tritonserver@sha256:153d3158d96346bc50df7fa6e1c3a96d6dc638249072be20ebbbcae07b8505ca
+    command: >
+      tritonserver
+      --model-repository=/models
+      --allow-http=true
+      --allow-grpc=true
+      --allow-metrics=true
+    volumes:
+      - ./model_repository:/models
+    ports:
+      - "8002:8002"
+    shm_size: "2gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  vllm:
+    image: vllm/vllm-openai:v0.33.0
+    command: >
+      --model Qwen/Qwen2.5-1.5B-Instruct
+      --served-model-name Qwen2.5-1.5B-Instruct
+      --gpu-memory-utilization 0.5
+      --max-model-len 4096
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  gateway:
+    build: ./gateway
+    environment:
+      - JWT_SECRET=${JWT_SECRET}
+      - STUDENT_NAME=${STUDENT_NAME}
+      - STUDENT_EMAIL=${STUDENT_EMAIL}
+      - CV_MODEL=${CV_MODEL}
+      - LLM_MODEL=${LLM_MODEL}
+      - TRITON_URL=http://triton:8000
+      - TRITON_METRICS_URL=http://triton:8002/metrics
+      - VLLM_URL=http://vllm:8000
+      - VLLM_METRICS_URL=http://vllm:8000/metrics
+      - NODE_METRICS_URL=http://node-exporter:9100/metrics
+      - GPU_NAME=${GPU_NAME:-unknown GPU}
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    depends_on:
+      - triton
+      - vllm
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.1
+    command:
+      - '--path.rootfs=/host'
+    volumes:
+      - '/:/host:ro,rslave'
+    ports:
+      - "9100:9100"
+    restart: unless-stopped
+
+volumes:
+  hf_cache:
+  prometheus_data:

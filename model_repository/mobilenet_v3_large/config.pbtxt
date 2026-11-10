@@ -1,0 +1,19 @@
+name: "mobilenet_v3_large"
+platform: "onnxruntime_onnx"
+max_batch_size: 8
+
+input [
+  { name: "INPUT__0"  data_type: TYPE_FP32  dims: [3, 224, 224] }
+]
+output [
+  { name: "OUTPUT__0" data_type: TYPE_FP32  dims: [1000] }
+]
+
+instance_group [
+  { kind: KIND_GPU, count: 1 }
+]
+
+dynamic_batching {
+  max_queue_delay_microseconds: 5000
+  preferred_batch_size: [2, 4, 8]
+}
