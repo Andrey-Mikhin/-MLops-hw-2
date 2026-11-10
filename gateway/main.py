@@ -1,13 +1,3 @@
-"""Real-time inference gateway.
-
-Ручки контракта:
-    /health, /metrics                        — без auth
-    /triton/health, /vllm/health             — без auth
-    /metrics/triton, /metrics/vllm, /metrics/node — без auth (прокси сырых метрик)
-    /info                                    — Bearer
-    /vision                                  — Bearer (multipart/form-data, поле file)
-    /chat                                    — Bearer (SSE-стрим)
-"""
 from __future__ import annotations
 
 import asyncio
@@ -27,9 +17,6 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from PIL import Image, UnidentifiedImageError
 from prometheus_fastapi_instrumentator import Instrumentator
 
-# ---------------------------------------------------------------------------
-# Конфиг из переменных окружения
-# ---------------------------------------------------------------------------
 JWT_SECRET = os.environ["JWT_SECRET"]
 STUDENT_NAME = os.environ.get("STUDENT_NAME", "")
 STUDENT_EMAIL = os.environ["STUDENT_EMAIL"]
@@ -42,12 +29,6 @@ VLLM_URL = os.environ.get("VLLM_URL", "http://vllm:8000")
 VLLM_METRICS_URL = os.environ.get("VLLM_METRICS_URL", "http://vllm:8000/metrics")
 NODE_METRICS_URL = os.environ.get("NODE_METRICS_URL", "http://node-exporter:9100/metrics")
 
-# ---------------------------------------------------------------------------
-# Модель + препроцессинг (ровно weights.transforms() для mobilenet_v3_large)
-# torchvision в gateway не стоит, поэтому препроцессинг воспроизведён руками
-# по официальным параметрам MobileNet_V3_Large_Weights.IMAGENET1K_V2:
-#   Resize(232), CenterCrop(224), ToTensor, Normalize(mean, std ImageNet).
-# ---------------------------------------------------------------------------
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 _RESIZE = 232
@@ -55,29 +36,21 @@ _CROP = 224
 
 
 def _preprocess(img: Image.Image) -> np.ndarray:
-    """PIL -> CHW FP32 NCHW (1,3,224,224) с ImageNet-нормализацией."""
     img = img.convert("RGB")
-    # Resize(232) с билинейной интерполяцией + CenterCrop(224) — как в weights.transforms()
     img = img.resize((_RESIZE, _RESIZE), Image.BILINEAR)
     left = (img.width - _CROP) // 2
     top = (img.height - _CROP) // 2
     img = img.crop((left, top, left + _CROP, top + _CROP))
     arr = np.asarray(img, dtype=np.float32) / 255.0
     arr = (arr - _MEAN) / _STD
-    arr = arr.transpose(2, 0, 1)  # HWC -> CHW
-    return arr[np.newaxis, ...].copy()  # (1,3,224,224)
+    arr = arr.transpose(2, 0, 1)
+    return arr[np.newaxis, ...].copy()
 
 
-# ---------------------------------------------------------------------------
-# Загрузка классов ImageNet
-# ---------------------------------------------------------------------------
 _CLASSES_PATH = Path(__file__).with_name("imagenet_classes.txt")
 IMAGENET_CLASSES = [line.strip() for line in _CLASSES_PATH.read_text().splitlines() if line.strip()]
 assert len(IMAGENET_CLASSES) == 1000, f"Ожидалось 1000 классов, получено {len(IMAGENET_CLASSES)}"
 
-# ---------------------------------------------------------------------------
-# FastAPI + метрики gateway
-# ---------------------------------------------------------------------------
 app = FastAPI(title="Real-time Inference Gateway")
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
@@ -88,24 +61,17 @@ async def get_current_user(creds: HTTPAuthorizationCredentials | None = Depends(
     if creds is None or not creds.credentials:
         raise HTTPException(status_code=401, detail="missing token")
     try:
-        # algorithms=["HS256"] отсекает alg=none и чужие алгоритмы
         payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"])
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="invalid token")
     return payload
 
 
-# ---------------------------------------------------------------------------
-# /health, /metrics уже есть от Instrumentator
-# ---------------------------------------------------------------------------
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
 
 
-# ---------------------------------------------------------------------------
-# Health бэкендов
-# ---------------------------------------------------------------------------
 @app.get("/triton/health")
 async def triton_health():
     try:
@@ -141,9 +107,6 @@ async def vllm_health():
     return {"backend": "vllm", "ready": True, "models": models}
 
 
-# ---------------------------------------------------------------------------
-# Прокси сырых метрик бэкендов
-# ---------------------------------------------------------------------------
 async def _proxy_metrics(url: str) -> Response:
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -170,11 +133,7 @@ async def metrics_node():
     return await _proxy_metrics(NODE_METRICS_URL)
 
 
-# ---------------------------------------------------------------------------
-# /info
-# ---------------------------------------------------------------------------
 def _detect_gpu() -> str:
-    """Марка GPU. Пытаемся через nvidia-smi, иначе fallback."""
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -185,7 +144,6 @@ def _detect_gpu() -> str:
             return out[0].strip()
     except Exception:
         pass
-    # Fallback, если gateway в контейнере без nvidia-smi
     return os.environ.get("GPU_NAME", "unknown GPU")
 
 
@@ -199,9 +157,6 @@ async def info(_user: dict = Depends(get_current_user)):
     }
 
 
-# ---------------------------------------------------------------------------
-# /vision
-# ---------------------------------------------------------------------------
 def _softmax(x: np.ndarray) -> np.ndarray:
     x = x - np.max(x)
     e = np.exp(x)
@@ -209,7 +164,6 @@ def _softmax(x: np.ndarray) -> np.ndarray:
 
 
 def _infer_triton(batch: np.ndarray) -> np.ndarray:
-    """Синхронный вызов Triton — выполняется в threadpool, не в event loop."""
     client = httpclient.InferenceServerClient(url=TRITON_URL, timeout=10.0)
     inp = httpclient.InferInput("INPUT__0", batch.shape, "FP32")
     inp.set_data_from_numpy(batch)
@@ -234,8 +188,8 @@ async def vision(
 
     t0 = time.perf_counter()
     try:
-        batch = _preprocess(img)                                     # CPU, быстро
-        logits = await asyncio.to_thread(_infer_triton, batch)       # не блокируем event loop
+        batch = _preprocess(img)
+        logits = await asyncio.to_thread(_infer_triton, batch)
     except Exception:
         raise HTTPException(status_code=502, detail="inference failed")
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -249,9 +203,6 @@ async def vision(
     return {"model": CV_MODEL, "predictions": predictions, "latency_ms": elapsed_ms}
 
 
-# ---------------------------------------------------------------------------
-# /chat — SSE-прокси к vLLM
-# ---------------------------------------------------------------------------
 @app.post("/chat")
 async def chat(request: Request, _user: dict = Depends(get_current_user)):
     try:
@@ -281,12 +232,10 @@ async def chat(request: Request, _user: dict = Depends(get_current_user)):
         await client.aclose()
         raise HTTPException(status_code=502, detail="vllm unavailable")
 
-    # Код ответа зафиксирован до отправки первого байта — ошибки отдаём честно
     if upstream.status_code >= 400:
         text = await upstream.aread()
         await upstream.aclose()
         await client.aclose()
-        # 4xx от vLLM (контекст, некорректный запрос) — пробрасываем как 400
         if 400 <= upstream.status_code < 500:
             raise HTTPException(status_code=400, detail=text.decode(errors="ignore"))
         raise HTTPException(status_code=502, detail="vllm error")
