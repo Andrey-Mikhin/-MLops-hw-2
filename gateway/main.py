@@ -5,6 +5,7 @@ import io
 import os
 import subprocess
 import time
+import traceback
 from pathlib import Path
 
 import httpx
@@ -29,6 +30,8 @@ VLLM_URL = os.environ.get("VLLM_URL", "http://vllm:8000")
 VLLM_METRICS_URL = os.environ.get("VLLM_METRICS_URL", "http://vllm:8000/metrics")
 NODE_METRICS_URL = os.environ.get("NODE_METRICS_URL", "http://node-exporter:9100/metrics")
 
+TRITON_GRPC_HOST = TRITON_URL.replace("http://", "").replace("https://", "")
+
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 _RESIZE = 232
@@ -37,7 +40,12 @@ _CROP = 224
 
 def _preprocess(img: Image.Image) -> np.ndarray:
     img = img.convert("RGB")
-    img = img.resize((_RESIZE, _RESIZE), Image.BILINEAR)
+    w, h = img.size
+    if w < h:
+        new_w, new_h = _RESIZE, int(round(h * _RESIZE / w))
+    else:
+        new_w, new_h = int(round(w * _RESIZE / h)), _RESIZE
+    img = img.resize((new_w, new_h), Image.BILINEAR)
     left = (img.width - _CROP) // 2
     top = (img.height - _CROP) // 2
     img = img.crop((left, top, left + _CROP, top + _CROP))
@@ -164,7 +172,11 @@ def _softmax(x: np.ndarray) -> np.ndarray:
 
 
 def _infer_triton(batch: np.ndarray) -> np.ndarray:
-    client = httpclient.InferenceServerClient(url=TRITON_URL, timeout=10.0)
+    client = httpclient.InferenceServerClient(
+        url=TRITON_GRPC_HOST,
+        connection_timeout=10000,
+        network_timeout=10000,
+    )
     inp = httpclient.InferInput("INPUT__0", batch.shape, "FP32")
     inp.set_data_from_numpy(batch)
     out = httpclient.InferRequestedOutput("OUTPUT__0")
@@ -191,6 +203,7 @@ async def vision(
         batch = _preprocess(img)
         logits = await asyncio.to_thread(_infer_triton, batch)
     except Exception:
+        traceback.print_exc()
         raise HTTPException(status_code=502, detail="inference failed")
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
